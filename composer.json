@@ -1,6 +1,6 @@
 {
-    "name": "skydiablo/keymile-koap",
-    "description": "ReactPHP-based async client library for Keymile MileGate MSAN devices using the KOAP protocol",
+    "name": "skydiablo/koap",
+    "description": "ReactPHP-based async client library for communicating with Keymile MileGate MSAN devices using the KOAP (Keymile Object Access Protocol) over the MTP (Message Transport Protocol) framing layer.",
     "type": "library",
     "license": "MIT",
     "require": {
