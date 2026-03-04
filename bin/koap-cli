@@ -1,0 +1,860 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use SkyDiablo\Keymile\Koap\Connection;
+use SkyDiablo\Keymile\Koap\KoapClient;
+use SkyDiablo\Keymile\Koap\Model\ManagedObject;
+
+use function React\Async\await;
+
+require __DIR__ . '/../vendor/autoload.php';
+
+// ─── Argument parsing ───────────────────────────────────────────────────────
+
+$restIndex = 0;
+$opts = getopt('h:p:u:P:c:v', [
+    'host:',
+    'port:',
+    'user:',
+    'pass:',
+    'class:',
+    'help',
+    'verbose',
+    'timeout:',
+], $restIndex);
+
+$args = array_slice($argv, $restIndex);
+
+$host    = $opts['h'] ?? $opts['host'] ?? null;
+$port    = (int) ($opts['p'] ?? $opts['port'] ?? 5556);
+$user    = $opts['u'] ?? $opts['user'] ?? '';
+$pass    = $opts['P'] ?? $opts['pass'] ?? '';
+$class   = $opts['c'] ?? $opts['class'] ?? 'information';
+$verbose = isset($opts['v']) || isset($opts['verbose']);
+$timeout = (float) ($opts['timeout'] ?? 10.0);
+$command = $args[0] ?? 'shell';
+$cmdArgs = array_slice($args, 1);
+
+if (isset($opts['help']) || $host === null) {
+    fwrite(STDERR, <<<'USAGE'
+    Keymile KOAP CLI — Test tool for MileGate devices
+
+    Usage:
+      koap-cli -h <host> [options] <command> [arguments]
+
+    Options:
+      -h, --host <ip>       Device IP address (required)
+      -p, --port <port>     TCP port (default: 5556)
+      -u, --user <name>     Username
+      -P, --pass <pw>       Password
+      -c, --class <class>   User class (default: information)
+      -v, --verbose         Show raw XML messages
+          --timeout <sec>   Connection timeout in seconds (default: 10)
+          --help            Show this help
+
+    Commands:
+      shell                 Interactive shell (persistent session)
+      discover [path]       Discover managed object tree (default: /)
+      get <path> <domain> <operation>
+                            Read a property value
+      set <path> <domain> <operation> <json-payload>
+                            Write a property value
+      raw <path> <domain> <operation> [json-payload]
+                            Send raw KOAP request, show full response
+      tree [path] [depth]   Recursively discover and display object tree
+      explore <path>        Probe all known domains/operations on an object
+      vlans [path]          Show VLAN configuration for port interfaces
+
+    If no command is given, starts in interactive shell mode.
+
+    Examples:
+      koap-cli -h 10.22.253.7 -u admin -P secret
+      koap-cli -h 10.22.253.7 -u admin -P secret discover /
+      koap-cli -h 10.22.253.7 -u admin -P secret tree / 2
+      koap-cli -h 10.22.253.7 -u admin -P secret vlans /unit-1
+
+
+    USAGE);
+    exit(isset($opts['help']) ? 0 : 1);
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+function info(string $msg): void
+{
+    fwrite(STDERR, "\033[36m▸\033[0m {$msg}\n");
+}
+
+function success(string $msg): void
+{
+    fwrite(STDERR, "\033[32m✓\033[0m {$msg}\n");
+}
+
+function error(string $msg): void
+{
+    fwrite(STDERR, "\033[31m✗\033[0m {$msg}\n");
+}
+
+function dumpPayload(mixed $data, string $indent = ''): void
+{
+    if (is_array($data)) {
+        foreach ($data as $key => $value) {
+            if (is_array($value)) {
+                echo "{$indent}\033[33m{$key}\033[0m:\n";
+                dumpPayload($value, $indent . '  ');
+            } else {
+                echo "{$indent}\033[33m{$key}\033[0m: {$value}\n";
+            }
+        }
+    } else {
+        echo "{$indent}{$data}\n";
+    }
+}
+
+function printManagedObject(ManagedObject $mo, string $prefix = ''): void
+{
+    $state = $mo->state !== '' ? " [{$mo->state}]" : '';
+    $admin = $mo->adminState !== '' ? " admin={$mo->adminState}" : '';
+    $name  = $mo->moName !== '' ? " \033[1m{$mo->moName}\033[0m" : '';
+    $addr  = $mo->addressFragment !== '' ? " ({$mo->addressFragment})" : '';
+    $type  = "\033[36m{$mo->moType}\033[0m";
+    $kids  = $mo->hasChildren ? ' [+]' : '';
+
+    echo "{$prefix}{$type}{$name}{$addr}{$state}{$admin}{$kids}\n";
+}
+
+// ─── Main ───────────────────────────────────────────────────────────────────
+
+try {
+    info("Connecting to {$host}:{$port} as '{$user}'...");
+
+    $client = new KoapClient($host, $port, $user, $pass, $class);
+    $connection = await($client->connect());
+
+    success('Connected and authenticated');
+
+    if ($command === 'shell') {
+        cmdShell($connection, $verbose, $host);
+    } else {
+        dispatchCommand($connection, $command, $cmdArgs, $verbose);
+        $connection->close();
+    }
+} catch (\Throwable $e) {
+    error($e->getMessage());
+    if ($verbose) {
+        fwrite(STDERR, $e->getTraceAsString() . "\n");
+    }
+    exit(1);
+}
+
+function dispatchCommand(Connection $conn, string $command, array $args, bool $verbose): void
+{
+    match ($command) {
+        'discover' => cmdDiscover($conn, $args, $verbose),
+        'get'      => cmdGet($conn, $args, $verbose),
+        'set'      => cmdSet($conn, $args, $verbose),
+        'raw'      => cmdRaw($conn, $args, $verbose),
+        'tree'     => cmdTree($conn, $args, $verbose),
+        'explore'  => cmdExplore($conn, $args, $verbose),
+        'vlans'    => cmdVlans($conn, $args, $verbose),
+        default    => throw new RuntimeException("Unknown command: {$command}"),
+    };
+}
+
+function cmdShell(Connection $conn, bool $verbose, string $host): void
+{
+    $cwd = '/';
+
+    echo "\033[1;37mKeymile KOAP Shell\033[0m — {$host}\n";
+    echo "Type \033[1mhelp\033[0m for commands, \033[1mquit\033[0m to exit.\n\n";
+
+    if (function_exists('readline_completion_function')) {
+        $commands = ['discover', 'tree', 'vlans', 'explore', 'raw', 'get', 'set', 'cd', 'ls', 'help', 'quit', 'exit', 'verbose'];
+        readline_completion_function(function (string $input) use ($commands): array {
+            return array_filter($commands, fn(string $c): bool => str_starts_with($c, $input));
+        });
+    }
+
+    while (true) {
+        $prompt = "\033[1;34m{$cwd}\033[0m \033[36mkoap>\033[0m ";
+
+        if (function_exists('readline')) {
+            $line = readline($prompt);  
+            if ($line === false) {
+                echo "\n";
+                break;
+            }
+            $line = trim($line);
+            if ($line !== '' && function_exists('readline_add_history')) {
+                readline_add_history($line);
+            }
+        } else {
+            fwrite(STDOUT, $prompt);
+            $line = fgets(STDIN);
+            if ($line === false) {
+                echo "\n";
+                break;
+            }
+            $line = trim($line);
+        }
+
+        if ($line === '' ) {
+            continue;
+        }
+
+        if ($line === 'quit' || $line === 'exit') {
+            $conn->close();
+            info('Disconnected.');
+            break;
+        }
+
+        if ($line === 'help' || $line === '?') {
+            printShellHelp();
+            continue;
+        }
+
+        if ($line === 'verbose') {
+            $verbose = !$verbose;
+            echo "Verbose mode: " . ($verbose ? "\033[32mon\033[0m" : "\033[31moff\033[0m") . "\n";
+            continue;
+        }
+
+        $parts = preg_split('/\s+/', $line);
+        if ($parts === false || $parts === []) {
+            continue;
+        }
+        $cmd = array_shift($parts);
+
+        // cd — change working path
+        if ($cmd === 'cd') {
+            $target = $parts[0] ?? '/';
+            if ($target === '..') {
+                $cwd = dirname($cwd);
+                if ($cwd === '.') {
+                    $cwd = '/';
+                }
+            } elseif (str_starts_with($target, '/')) {
+                $cwd = $target;
+            } else {
+                $cwd = rtrim($cwd, '/') . '/' . $target;
+            }
+            continue;
+        }
+
+        // ls — shortcut for discover on cwd or path
+        if ($cmd === 'ls') {
+            $target = $parts[0] ?? $cwd;
+            if (!str_starts_with($target, '/')) {
+                $target = rtrim($cwd, '/') . '/' . $target;
+            }
+            $parts = [$target];
+            $cmd = 'discover';
+        }
+
+        // Resolve relative paths for commands that take a path as first arg
+        if (in_array($cmd, ['discover', 'tree', 'vlans', 'explore', 'raw', 'get', 'set'], true)) {
+            if (isset($parts[0]) && !str_starts_with($parts[0], '/')) {
+                $parts[0] = rtrim($cwd, '/') . '/' . $parts[0];
+            } elseif (!isset($parts[0]) && in_array($cmd, ['discover', 'tree', 'vlans'], true)) {
+                $parts[0] = $cwd;
+            }
+        }
+
+        try {
+            if (!$conn->isConnected()) {
+                error('Connection lost.');
+                break;
+            }
+            dispatchCommand($conn, $cmd, $parts, $verbose);
+        } catch (\RuntimeException $e) {
+            error($e->getMessage());
+        } catch (\Throwable $e) {
+            error($e->getMessage());
+            if ($verbose) {
+                fwrite(STDERR, $e->getTraceAsString() . "\n");
+            }
+        }
+
+        echo "\n";
+    }
+}
+
+function printShellHelp(): void
+{
+    echo <<<'HELP'
+
+    ┌─────────────────────────────────────────────────────────┐
+    │  Keymile KOAP Interactive Shell                         │
+    ├─────────────────────────────────────────────────────────┤
+    │  Navigation:                                            │
+    │    cd <path>          Change working path               │
+    │    ls [path]          List children (= discover)        │
+    │                                                         │
+    │  Commands:                                              │
+    │    discover [path]    Discover managed object            │
+    │    tree [path] [N]    Show object tree (depth N)        │
+    │    vlans [path]       Show VLAN profile assignments     │
+    │    explore <path>     Probe available operations         │
+    │    raw <p> <d> <op>   Send raw KOAP request             │
+    │    get <p> <d> <op>   Read a property                   │
+    │    set <p> <d> <op> <json>  Write a property            │
+    │                                                         │
+    │  Shell:                                                 │
+    │    verbose            Toggle verbose mode                │
+    │    help / ?           Show this help                     │
+    │    quit / exit        Disconnect and exit                │
+    │                                                         │
+    │  Paths are relative to current working path.            │
+    │  Use absolute paths starting with / if needed.          │
+    └─────────────────────────────────────────────────────────┘
+
+    HELP;
+}
+
+// ─── Commands ───────────────────────────────────────────────────────────────
+
+function cmdDiscover(Connection $conn, array $args, bool $verbose): void
+{
+    $path = $args[0] ?? '/';
+    info("Discovering '{$path}'...");
+
+    $response = await($conn->execute($path, 'main', 'getDiscover'));
+    $op = $response->getFirstOperation();
+
+    if ($op === null || !$op->isSuccessful()) {
+        error('Discover failed: ' . ($op->executionStatus ?? 'no response'));
+        return;
+    }
+
+    $discover = $op->payload['Discover'] ?? $op->payload;
+    /** @var array<string, mixed> $info */
+    $info = $discover['info'] ?? $discover;
+    $mo = ManagedObject::fromArray($info);
+
+    success('Discover result:');
+    printManagedObject($mo);
+
+    if ($mo->adfReference !== '') {
+        echo "  ADF reference: {$mo->adfReference}\n";
+    }
+    if ($mo->assignedMoName !== '') {
+        echo "  Assigned name: {$mo->assignedMoName}\n";
+    }
+
+    $children = extractChildren($discover);
+    if ($children !== []) {
+        echo "\n  Children (" . count($children) . "):\n";
+        foreach ($children as $child) {
+            $childMo = ManagedObject::fromArray($child);
+            printManagedObject($childMo, '    ');
+        }
+    }
+}
+
+function cmdGet(Connection $conn, array $args, bool $verbose): void
+{
+    if (count($args) < 3) {
+        throw new RuntimeException('Usage: get <path> <domain> <operation>');
+    }
+
+    [$path, $domain, $operation] = $args;
+    info("GET {$path} / {$domain} / {$operation}");
+
+    $result = await($conn->get($path, $domain, $operation));
+
+    success('Response:');
+    dumpPayload($result);
+}
+
+function cmdSet(Connection $conn, array $args, bool $verbose): void
+{
+    if (count($args) < 4) {
+        throw new RuntimeException('Usage: set <path> <domain> <operation> <json-payload>');
+    }
+
+    [$path, $domain, $operation, $jsonPayload] = $args;
+
+    /** @var array<string, mixed>|null $payload */
+    $payload = json_decode($jsonPayload, true);
+    if ($payload === null) {
+        throw new RuntimeException('Invalid JSON payload');
+    }
+
+    info("SET {$path} / {$domain} / {$operation}");
+
+    $response = await($conn->set($path, $domain, $operation, $payload));
+
+    if ($response->isSuccessful()) {
+        success('Set operation successful');
+    } else {
+        error('Set operation returned errors');
+    }
+}
+
+function cmdRaw(Connection $conn, array $args, bool $verbose): void
+{
+    if (count($args) < 3) {
+        throw new RuntimeException('Usage: raw <path> <domain> <operation> [json-payload]');
+    }
+
+    [$path, $domain, $operation] = $args;
+    $jsonPayload = $args[3] ?? null;
+
+    /** @var array<string, mixed> $payload */
+    $payload = [];
+    if ($jsonPayload !== null) {
+        $decoded = json_decode($jsonPayload, true);
+        if (!is_array($decoded)) {
+            throw new RuntimeException('Invalid JSON payload');
+        }
+        $payload = $decoded;
+    }
+
+    info("RAW {$path} / {$domain} / {$operation}");
+
+    $response = await($conn->execute($path, $domain, $operation, $payload));
+
+    success("Response seq={$response->seq} destAddr={$response->destAddr} domain={$response->mDomain}");
+
+    foreach ($response->operations as $op) {
+        $status = $op->executionStatus ?? 'none';
+        echo "\n  \033[1mOperation:\033[0m {$op->name} (seq={$op->seq}, status={$status})\n";
+        if (!empty($op->payload)) {
+            dumpPayload($op->payload, '    ');
+        }
+    }
+}
+
+function cmdTree(Connection $conn, array $args, bool $verbose): void
+{
+    $rootPath = $args[0] ?? '/';
+    $maxDepth = (int) ($args[1] ?? 2);
+
+    info("Building tree from '{$rootPath}' (depth {$maxDepth})...");
+
+    discoverRecursive($conn, $rootPath, $maxDepth, 0, '', '');
+}
+
+function discoverRecursive(
+    Connection $conn,
+    string $path,
+    int $maxDepth,
+    int $currentDepth,
+    string $linePrefix,
+    string $treePrefix,
+): void {
+    try {
+        $response = await($conn->execute($path, 'main', 'getDiscover'));
+        $op = $response->getFirstOperation();
+
+        if ($op === null || !$op->isSuccessful()) {
+            $status = $op?->executionStatus ?? 'no operation';
+            echo "{$linePrefix}\033[31m[{$status}]\033[0m\n";
+            return;
+        }
+
+        $discover = $op->payload['Discover'] ?? $op->payload;
+        /** @var array<string, mixed> $info */
+        $info = $discover['info'] ?? $discover;
+        $mo = ManagedObject::fromArray($info);
+
+        printManagedObject($mo, $linePrefix);
+
+        if ($mo->hasChildren && $currentDepth < $maxDepth) {
+            $children = extractChildren($discover);
+            $last = count($children) - 1;
+
+            $basePath = rtrim($path, '/');
+
+            foreach ($children as $i => $childData) {
+                $isLast = ($i === $last);
+                $connector = $isLast ? '└── ' : '├── ';
+                $nextTreePrefix = $treePrefix . ($isLast ? '    ' : '│   ');
+
+                $childAddr = $childData['addressFragment'] ?? $childData['addressfragment'] ?? '';
+                if ($childAddr === '') {
+                    continue;
+                }
+
+                $childPath = $basePath . '/' . $childAddr;
+                discoverRecursive(
+                    $conn,
+                    $childPath,
+                    $maxDepth,
+                    $currentDepth + 1,
+                    $treePrefix . $connector,
+                    $nextTreePrefix,
+                );
+            }
+        }
+    } catch (\Throwable $e) {
+        echo "{$linePrefix}\033[31m[error: {$e->getMessage()}]\033[0m\n";
+    }
+}
+
+function cmdExplore(Connection $conn, array $args, bool $verbose): void
+{
+    $path = $args[0] ?? '/';
+    info("Exploring '{$path}'...");
+
+    $response = await($conn->execute($path, 'main', 'getDiscover'));
+    $op = $response->getFirstOperation();
+
+    if ($op === null || !$op->isSuccessful()) {
+        error('Cannot discover object at ' . $path);
+        return;
+    }
+
+    $discover = $op->payload['Discover'] ?? $op->payload;
+    /** @var array<string, mixed> $info */
+    $info = $discover['info'] ?? $discover;
+    $mo = ManagedObject::fromArray($info);
+
+    echo "\n\033[1;37m══ Object Info ══\033[0m\n";
+    printManagedObject($mo);
+    echo "  ADF: {$mo->adfReference}\n";
+    if ($mo->assignedMoName !== '') {
+        echo "  Assigned: {$mo->assignedMoName}\n";
+    }
+    echo "  KOAP version: {$mo->koapVersion}\n";
+
+    $probes = getProbesForMoType($mo->moType);
+
+    echo "\n\033[1;37m══ Probing Domains & Operations ══\033[0m\n";
+
+    foreach ($probes as $domain => $operations) {
+        $found = [];
+
+        foreach ($operations as $operation) {
+            try {
+                $res = await($conn->execute($path, $domain, $operation));
+                $resOp = $res->getFirstOperation();
+
+                if ($resOp === null) {
+                    continue;
+                }
+
+                if ($resOp->isSuccessful()) {
+                    $found[] = ['op' => $operation, 'status' => 'success', 'payload' => $resOp->payload];
+                } elseif ($verbose) {
+                    $errorId = $resOp->payload['error']['id'] ?? ($resOp->executionStatus ?? '');
+                    $found[] = ['op' => $operation, 'status' => $resOp->executionStatus ?? 'error', 'error' => $errorId];
+                }
+            } catch (\Throwable) {
+                // skip
+            }
+        }
+
+        if ($found === []) {
+            echo "\n\033[2m  [{$domain}] — no successful operations\033[0m\n";
+            continue;
+        }
+
+        $successCount = count(array_filter($found, fn($f) => $f['status'] === 'success'));
+        if ($successCount === 0 && !$verbose) {
+            echo "\n\033[2m  [{$domain}] — no successful operations\033[0m\n";
+            continue;
+        }
+
+        echo "\n\033[1;33m  [{$domain}]\033[0m\n";
+        foreach ($found as $f) {
+            if ($f['status'] === 'success') {
+                echo "    \033[32m✓\033[0m {$f['op']}\n";
+                if (!empty($f['payload'])) {
+                    dumpPayload($f['payload'], '        ');
+                }
+            } elseif ($verbose) {
+                echo "    \033[31m✗\033[0m {$f['op']} ({$f['status']}: {$f['error']})\n";
+            }
+        }
+    }
+
+    echo "\n";
+}
+
+/**
+ * Return domain→operations probes tailored to the moType (from ADF analysis).
+ *
+ * @return array<string, list<string>>
+ */
+function getProbesForMoType(string $moType): array
+{
+    $common = [
+        'main' => ['getLabel', 'getAlarmSeverity'],
+    ];
+
+    $specific = match (true) {
+        str_starts_with($moType, 'ctp.subif') => [
+            'cfgm' => [
+                'getvlanProfile', 'getconfig', 'getlogonOptions', 'getagentCircuitId',
+                'getautomaticAgentCircuitId', 'getvlanRange', 'getifRateLimiting',
+                'getmacSourceFilteringMode', 'getl2cpFilter', 'getsrcMacBlacklist',
+                'getEnableInterfaceConfiguration', 'getEnableIgmpClass', 'getGroupManagement',
+            ],
+            'status' => [
+                'getInterfaceId', 'getEcmPortCounters', 'getEcmPortCopperGenStat',
+                'getEcmPortDDM', 'getEcmMacStatus', 'getwfQueues', 'getmacForwardingList',
+            ],
+            'pm' => ['getUserCounter'],
+            'ifMIB' => ['getIfTableEntry_Prop'],
+        ],
+        str_starts_with($moType, 'port.eth') => [
+            'cfgm' => [
+                'getPortConfig', 'getFlowControl', 'getAutoNegotiation', 'getMediaType',
+                'getAutoSensing', 'getSpeedDuplexConfig', 'getPriorityMapping',
+                'getvlanConfig', 'getServiceConfig',
+            ],
+            'status' => [
+                'getPhysStatus', 'getEcmPortCounters', 'getEcmPortDDM',
+                'getEcmPortCopperGenStat', 'getEcmMacStatus',
+            ],
+            'pm' => ['getUserCounter'],
+        ],
+        str_starts_with($moType, 'unit.') => [
+            'cfgm' => ['getEquipmentConfig', 'getTimeConfig', 'getEthConfig'],
+            'status' => ['getEquipmentStatus', 'getHwInfo', 'getSwVersion'],
+            'fm' => ['getCompleteAlarmLogbook', 'getCompleteEventLogbook'],
+        ],
+        str_starts_with($moType, 'service.') || str_starts_with($moType, 'group.services') => [
+            'main' => ['getLabel', 'getAlarmSeverity'],
+            'cfgm' => [
+                'getServiceConfig', 'getvlanConfig', 'getconfig', 'getServiceProfile',
+                'getTrafficDescriptor', 'getPriorityMapping', 'getPortList',
+                'getVlanTranslation', 'getBngList',
+            ],
+            'status' => ['getServiceStatus', 'getPortCounters'],
+        ],
+        default => [
+            'main' => ['getLabel', 'getAlarmSeverity'],
+            'cfgm' => ['getconfig', 'getServiceConfig', 'getPriorityMapping'],
+            'status' => ['getStatus', 'getPortCounters'],
+            'fm' => ['getCompleteAlarmLogbook'],
+            'pm' => ['getUserCounter'],
+        ],
+    };
+
+    foreach ($common as $domain => $ops) {
+        $specific[$domain] = array_unique(array_merge($ops, $specific[$domain] ?? []));
+    }
+
+    return $specific;
+}
+
+function cmdVlans(Connection $conn, array $args, bool $verbose): void
+{
+    $path = $args[0] ?? '/unit-1';
+    info("Reading VLAN configuration for '{$path}'...");
+
+    $response = await($conn->execute($path, 'main', 'getDiscover'));
+    $op = $response->getFirstOperation();
+
+    if ($op === null || !$op->isSuccessful()) {
+        error('Cannot discover object at ' . $path);
+        return;
+    }
+
+    $discover = $op->payload['Discover'] ?? $op->payload;
+    /** @var array<string, mixed> $rootInfo */
+    $rootInfo = $discover['info'] ?? $discover;
+    $rootMo = ManagedObject::fromArray($rootInfo);
+
+    /** @var list<string> $availableProfiles */
+    $availableProfiles = [];
+
+    if (str_starts_with($rootMo->moType, 'ctp.subif')) {
+        readAndPrintVlan($conn, $path, $verbose, $availableProfiles);
+        return;
+    }
+
+    if (str_starts_with($rootMo->moType, 'port.eth')) {
+        printPortVlans($conn, $path, $rootMo, $discover, $verbose, $availableProfiles);
+        return;
+    }
+
+    $children = extractChildren($discover);
+    $ports = array_filter($children, fn($c) => str_starts_with(
+        (string) ($c['moType'] ?? $c['motype'] ?? ''),
+        'port.eth',
+    ));
+
+    if ($ports === []) {
+        error("No ethernet ports found under {$path}");
+        return;
+    }
+
+    $basePath = rtrim($path, '/');
+
+    echo "\n";
+    foreach ($ports as $portData) {
+        $addr = (string) ($portData['addressFragment'] ?? $portData['addressfragment'] ?? '');
+        if ($addr === '') {
+            continue;
+        }
+
+        $portPath = $basePath . '/' . $addr;
+        $portMo = ManagedObject::fromArray($portData);
+
+        if ($portMo->adminState === 'down') {
+            echo "\033[2m{$addr} — down\033[0m\n";
+            continue;
+        }
+
+        try {
+            $portRes = await($conn->execute($portPath, 'main', 'getDiscover'));
+            $portOp = $portRes->getFirstOperation();
+            if ($portOp === null || !$portOp->isSuccessful()) {
+                echo "\033[33m{$addr}\033[0m: [discover failed]\n";
+                continue;
+            }
+            $portDiscover = $portOp->payload['Discover'] ?? $portOp->payload;
+            printPortVlans($conn, $portPath, $portMo, $portDiscover, $verbose, $availableProfiles);
+        } catch (\Throwable $e) {
+            echo "\033[33m{$addr}\033[0m: [error: {$e->getMessage()}]\n";
+        }
+    }
+
+    printAvailableProfiles($availableProfiles);
+}
+
+/**
+ * @param list<string> $availableProfiles Collected during scan
+ */
+function printAvailableProfiles(array $availableProfiles): void
+{
+    $unique = array_unique($availableProfiles);
+    sort($unique);
+
+    if ($unique === []) {
+        return;
+    }
+
+    echo "\033[1;37m── Available VLAN Profiles ──\033[0m\n";
+    foreach ($unique as $name) {
+        echo "  \033[1;32m{$name}\033[0m\n";
+    }
+}
+
+/**
+ * @param list<string> $availableProfiles
+ */
+function printPortVlans(
+    Connection $conn,
+    string $portPath,
+    ManagedObject $portMo,
+    array $portDiscover,
+    bool $verbose,
+    array &$availableProfiles,
+): void {
+    $name = $portMo->moName !== '' ? " \033[1m{$portMo->moName}\033[0m" : '';
+    $admin = $portMo->adminState !== '' ? " admin={$portMo->adminState}" : '';
+    $fragment = basename($portPath);
+
+    $interfaces = extractChildren($portDiscover);
+    $ifList = array_filter($interfaces, fn($c) => str_starts_with(
+        (string) ($c['moType'] ?? $c['motype'] ?? ''),
+        'ctp.subif',
+    ));
+
+    if ($ifList === []) {
+        return;
+    }
+
+    echo "\033[36m{$fragment}\033[0m{$name}{$admin}\n";
+
+    foreach ($ifList as $ifData) {
+        $ifAddr = (string) ($ifData['addressFragment'] ?? $ifData['addressfragment'] ?? '');
+        if ($ifAddr === '') {
+            continue;
+        }
+        $ifPath = rtrim($portPath, '/') . '/' . $ifAddr;
+        readAndPrintVlan($conn, $ifPath, $verbose, $availableProfiles);
+    }
+}
+
+/**
+ * @param list<string> $availableProfiles
+ */
+function readAndPrintVlan(Connection $conn, string $path, bool $verbose, array &$availableProfiles): void
+{
+    $fragment = basename($path);
+
+    try {
+        $res = await($conn->execute($path, 'cfgm', 'getvlanProfile'));
+        $op = $res->getFirstOperation();
+
+        if ($op === null || !$op->isSuccessful()) {
+            $status = $op?->executionStatus ?? 'no response';
+            echo "  \033[33m{$fragment}\033[0m: [{$status}]\n";
+            return;
+        }
+
+        $profiles = $op->payload['availableVlanProfiles'] ?? $op->payload;
+        $profileData = $profiles['profileName'] ?? [];
+        $selected = '';
+        if (is_array($profileData)) {
+            $sel = $profileData['selectedItem'] ?? [];
+            $selected = is_array($sel) ? (string) ($sel['name'] ?? '') : (string) $sel;
+
+            // Collect available profile names
+            $items = $profileData['item'] ?? [];
+            if (is_array($items)) {
+                if (!array_is_list($items)) {
+                    $items = [$items];
+                }
+                foreach ($items as $item) {
+                    $itemName = is_array($item) ? (string) ($item['name'] ?? '') : (string) $item;
+                    if ($itemName !== '' && $itemName !== 'default') {
+                        $availableProfiles[] = $itemName;
+                    }
+                }
+            }
+        }
+
+        echo "  \033[33m{$fragment}\033[0m: ";
+        if ($selected !== '' && $selected !== 'default') {
+            echo "\033[1;32m{$selected}\033[0m";
+        } elseif ($selected === 'default') {
+            echo "\033[2mdefault\033[0m";
+        } else {
+            echo "\033[2m—\033[0m";
+        }
+        echo "\n";
+
+        if ($verbose) {
+            dumpPayload($op->payload, '    ');
+        }
+    } catch (\Throwable $e) {
+        echo "  \033[33m{$fragment}\033[0m: [error: {$e->getMessage()}]\n";
+    }
+}
+
+/**
+ * Extract child entries from a parsed Discover element.
+ *
+ * XML structure: <Discover><info>...</info><ChildList><info>...</info>...</ChildList></Discover>
+ *
+ * @param array<string, mixed> $discover
+ * @return list<array<string, mixed>>
+ */
+function extractChildren(array $discover): array
+{
+    $childList = $discover['ChildList'] ?? [];
+    if (!is_array($childList) || $childList === []) {
+        return [];
+    }
+
+    $infos = $childList['info'] ?? [];
+    if (!is_array($infos)) {
+        return [];
+    }
+
+    // Single child: info is an associative array (not a list)
+    if ($infos !== [] && !array_is_list($infos)) {
+        return [$infos];
+    }
+
+    /** @var list<array<string, mixed>> $infos */
+    return $infos;
+}
