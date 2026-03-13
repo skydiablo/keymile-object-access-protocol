@@ -35,14 +35,15 @@ $class   = $opts['c'] ?? $opts['class'] ?? 'information';
 $verbose = isset($opts['v']) || isset($opts['verbose']);
 $timeout = (float) ($opts['timeout'] ?? 10.0);
 $command = $args[0] ?? 'shell';
-$cmdArgs = array_slice($args, 1);
+$cmdArgTokens = array_slice($args, 1);
+$cmdParams = parseNamedArgs($cmdArgTokens);
 
 if (isset($opts['help']) || $host === null) {
     fwrite(STDERR, <<<'USAGE'
     Keymile KOAP CLI — Test tool for MileGate devices
 
     Usage:
-      koap-cli -h <host> [options] <command> [arguments]
+      koap-cli -h <host> [options] <command> [--key=value ...]
 
     Options:
       -h, --host <ip>       Device IP address (required)
@@ -54,30 +55,142 @@ if (isset($opts['help']) || $host === null) {
           --timeout <sec>   Connection timeout in seconds (default: 10)
           --help            Show this help
 
-    Commands:
-      shell                 Interactive shell (persistent session)
-      discover [path] [domain]  Discover managed object (default path: /, domain: main)
-      get <path> <domain> <operation>
-                            Read a property value
-      set <path> <domain> <operation> <json-payload>
-                            Write a property value
-      raw <path> <domain> <operation> [json-payload]
-                            Send raw KOAP request, show full response
-      tree [path] [depth] [domain]  Recursively discover object tree (default domain: main)
-      explore [path] [domain]       Probe all known domains/operations (default domain: main)
-      vlans [path] [domain]        Show VLAN configuration (default domain: main)
+    Commands (all use named parameters, e.g. --path=/ --domain=main):
+      shell
+          Interactive shell (persistent session)
+      discover [--path=/] [--domain=main]
+          Discover managed object
+      get --path=<path> --domain=<domain> --operation=<operation>
+          Read a property value
+      set --path=<path> --domain=<domain> --operation=<operation> --payload=<json>
+          Write a property value
+      raw --path=<path> --domain=<domain> --operation=<operation> [--payload=<json>]
+          Send raw KOAP request, show full response
+      tree [--path=/] [--depth=2] [--domain=main]
+          Recursively discover object tree
+      explore [--path=/] [--domain=main]
+          Probe all known domains/operations
+      vlans [--path=/unit-1] [--domain=main]
+          Show VLAN configuration
 
     If no command is given, starts in interactive shell mode.
 
     Examples:
       koap-cli -h 10.22.253.7 -u admin -P secret
-      koap-cli -h 10.22.253.7 -u admin -P secret discover /
-      koap-cli -h 10.22.253.7 -u admin -P secret tree / 2
-      koap-cli -h 10.22.253.7 -u admin -P secret vlans /unit-1
+      koap-cli -h 10.22.253.7 -u admin -P secret discover --path=/
+      koap-cli -h 10.22.253.7 -u admin -P secret discover --path=/ --domain=cfgm
+      koap-cli -h 10.22.253.7 -u admin -P secret tree --path=/ --depth=2
+      koap-cli -h 10.22.253.7 -u admin -P secret vlans --path=/unit-1
+      koap-cli -h 10.22.253.7 -u admin -P secret get --path=/unit-1/port-1 --domain=main --operation=getLabel
 
 
     USAGE);
     exit(isset($opts['help']) ? 0 : 1);
+}
+
+// ─── Named argument parsing ──────────────────────────────────────────────────
+
+/**
+ * Split a line into tokens, respecting single- and double-quoted strings.
+ *
+ * @return list<string>
+ */
+function tokenizeLine(string $line): array
+{
+    $tokens = [];
+    $len = strlen($line);
+    $i = 0;
+    while ($i < $len) {
+        while ($i < $len && preg_match('/\s/', $line[$i])) {
+            $i++;
+        }
+        if ($i >= $len) {
+            break;
+        }
+        $quote = $line[$i];
+        if ($quote === '"' || $quote === "'") {
+            $i++;
+            $start = $i;
+            while ($i < $len && $line[$i] !== $quote) {
+                if ($line[$i] === '\\' && $i + 1 < $len) {
+                    $i += 2;
+                    continue;
+                }
+                $i++;
+            }
+            $tokens[] = substr($line, $start, $i - $start);
+            if ($i < $len) {
+                $i++;
+            }
+            continue;
+        }
+        $start = $i;
+        while ($i < $len && !preg_match('/\s/', $line[$i]) && $line[$i] !== '"' && $line[$i] !== "'") {
+            $i++;
+        }
+        $tokens[] = substr($line, $start, $i - $start);
+    }
+    return $tokens;
+}
+
+/**
+ * Parse tokens like --key=value or --key value into an associative array.
+ * Keys are normalized (leading -- removed). Values are trimmed of surrounding quotes.
+ *
+ * @param list<string> $tokens
+ * @return array<string, string>
+ */
+function parseNamedArgs(array $tokens): array
+{
+    $params = [];
+    $i = 0;
+    while ($i < count($tokens)) {
+        $token = $tokens[$i];
+        if (str_starts_with($token, '--')) {
+            $eq = strpos($token, '=');
+            if ($eq !== false) {
+                $key = substr($token, 2, $eq - 2);
+                $value = substr($token, $eq + 1);
+                $value = trimQuoted($value);
+                $params[$key] = $value;
+            } else {
+                $key = substr($token, 2);
+                $i++;
+                if ($i < count($tokens)) {
+                    $params[$key] = trimQuoted($tokens[$i]);
+                }
+                // else: flag without value, skip
+            }
+            $i++;
+            continue;
+        }
+        $i++;
+    }
+    return $params;
+}
+
+function trimQuoted(string $value): string
+{
+    $len = strlen($value);
+    if ($len >= 2 && (($value[0] === '"' && $value[$len - 1] === '"') || ($value[0] === "'" && $value[$len - 1] === "'"))) {
+        return substr($value, 1, -1);
+    }
+    return $value;
+}
+
+/**
+ * Require a list of parameter names; throw with usage hint if any is missing.
+ *
+ * @param array<string, string> $params
+ * @param list<string> $required
+ * @param string $usage
+ */
+function requireParams(array $params, array $required, string $usage): void
+{
+    $missing = array_filter($required, fn(string $k) => !isset($params[$k]) || $params[$k] === '');
+    if ($missing !== []) {
+        throw new RuntimeException('Missing required parameter(s): --' . implode(', --', $missing) . '. Usage: ' . $usage);
+    }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -138,7 +251,7 @@ try {
     if ($command === 'shell') {
         cmdShell($connection, $verbose, $host);
     } else {
-        dispatchCommand($connection, $command, $cmdArgs, $verbose);
+        dispatchCommand($connection, $command, $cmdParams, $verbose);
         $connection->close();
     }
 } catch (\Throwable $e) {
@@ -149,16 +262,19 @@ try {
     exit(1);
 }
 
-function dispatchCommand(Connection $conn, string $command, array $args, bool $verbose): void
+/**
+ * @param array<string, string> $params Named parameters (e.g. ['path' => '/', 'domain' => 'main'])
+ */
+function dispatchCommand(Connection $conn, string $command, array $params, bool $verbose): void
 {
     match ($command) {
-        'discover' => cmdDiscover($conn, $args, $verbose),
-        'get'      => cmdGet($conn, $args, $verbose),
-        'set'      => cmdSet($conn, $args, $verbose),
-        'raw'      => cmdRaw($conn, $args, $verbose),
-        'tree'     => cmdTree($conn, $args, $verbose),
-        'explore'  => cmdExplore($conn, $args, $verbose),
-        'vlans'    => cmdVlans($conn, $args, $verbose),
+        'discover' => cmdDiscover($conn, $params, $verbose),
+        'get'      => cmdGet($conn, $params, $verbose),
+        'set'      => cmdSet($conn, $params, $verbose),
+        'raw'      => cmdRaw($conn, $params, $verbose),
+        'tree'     => cmdTree($conn, $params, $verbose),
+        'explore'  => cmdExplore($conn, $params, $verbose),
+        'vlans'    => cmdVlans($conn, $params, $verbose),
         default    => throw new RuntimeException("Unknown command: {$command}"),
     };
 }
@@ -221,15 +337,16 @@ function cmdShell(Connection $conn, bool $verbose, string $host): void
             continue;
         }
 
-        $parts = preg_split('/\s+/', $line);
-        if ($parts === false || $parts === []) {
+        $tokens = tokenizeLine($line);
+        if ($tokens === []) {
             continue;
         }
-        $cmd = array_shift($parts);
+        $cmd = array_shift($tokens);
+        $params = parseNamedArgs($tokens);
 
-        // cd — change working path
+        // cd — change working path (--path=... or --path ...)
         if ($cmd === 'cd') {
-            $target = $parts[0] ?? '/';
+            $target = $params['path'] ?? '/';
             if ($target === '..') {
                 $cwd = dirname($cwd);
                 if ($cwd === '.') {
@@ -243,22 +360,22 @@ function cmdShell(Connection $conn, bool $verbose, string $host): void
             continue;
         }
 
-        // ls — shortcut for discover on cwd or path
+        // ls — shortcut for discover on cwd or --path
         if ($cmd === 'ls') {
-            $target = $parts[0] ?? $cwd;
-            if (!str_starts_with($target, '/')) {
-                $target = rtrim($cwd, '/') . '/' . $target;
+            $params['path'] = $params['path'] ?? $cwd;
+            if (!str_starts_with($params['path'], '/')) {
+                $params['path'] = rtrim($cwd, '/') . '/' . $params['path'];
             }
-            $parts = [$target];
             $cmd = 'discover';
         }
 
-        // Resolve relative paths for commands that take a path as first arg
+        // Resolve relative paths for commands that take --path
         if (in_array($cmd, ['discover', 'tree', 'vlans', 'explore', 'raw', 'get', 'set'], true)) {
-            if (isset($parts[0]) && !str_starts_with($parts[0], '/')) {
-                $parts[0] = rtrim($cwd, '/') . '/' . $parts[0];
-            } elseif (!isset($parts[0]) && in_array($cmd, ['discover', 'tree', 'vlans'], true)) {
-                $parts[0] = $cwd;
+            if (isset($params['path']) && $params['path'] !== '' && !str_starts_with($params['path'], '/')) {
+                $params['path'] = rtrim($cwd, '/') . '/' . $params['path'];
+            }
+            if (in_array($cmd, ['discover', 'tree', 'vlans', 'explore'], true) && (!isset($params['path']) || $params['path'] === '')) {
+                $params['path'] = $cwd;
             }
         }
 
@@ -267,7 +384,7 @@ function cmdShell(Connection $conn, bool $verbose, string $host): void
                 error('Connection lost.');
                 break;
             }
-            dispatchCommand($conn, $cmd, $parts, $verbose);
+            dispatchCommand($conn, $cmd, $params, $verbose);
         } catch (\RuntimeException $e) {
             error($e->getMessage());
         } catch (\Throwable $e) {
@@ -288,18 +405,20 @@ function printShellHelp(): void
     ┌─────────────────────────────────────────────────────────┐
     │  Keymile KOAP Interactive Shell                         │
     ├─────────────────────────────────────────────────────────┤
+    │  All commands use named parameters: --key=value           │
+    │                                                         │
     │  Navigation:                                            │
-    │    cd <path>          Change working path               │
-    │    ls [path]          List children (= discover)        │
+    │    cd --path=<path>    Change working path               │
+    │    ls [--path=<path>]  List children (= discover)        │
     │                                                         │
     │  Commands:                                              │
-    │    discover [path] [domain]   Discover (default domain: main) │
-    │    tree [path] [depth] [domain]  Object tree (default domain: main) │
-    │    vlans [path] [domain]      VLAN profile assignments  │
-    │    explore [path] [domain]    Probe available operations │
-    │    raw <p> <d> <op>   Send raw KOAP request             │
-    │    get <p> <d> <op>   Read a property                   │
-    │    set <p> <d> <op> <json>  Write a property            │
+    │    discover [--path=/] [--domain=main]                   │
+    │    tree [--path=/] [--depth=2] [--domain=main]           │
+    │    vlans [--path=/unit-1] [--domain=main]               │
+    │    explore [--path=/] [--domain=main]                    │
+    │    raw --path=<p> --domain=<d> --operation=<op> [--payload=<json>] │
+    │    get --path=<p> --domain=<d> --operation=<op>         │
+    │    set --path=<p> --domain=<d> --operation=<op> --payload=<json> │
     │                                                         │
     │  Shell:                                                 │
     │    verbose            Toggle verbose mode                │
@@ -307,7 +426,6 @@ function printShellHelp(): void
     │    quit / exit        Disconnect and exit                │
     │                                                         │
     │  Paths are relative to current working path.            │
-    │  Use absolute paths starting with / if needed.          │
     └─────────────────────────────────────────────────────────┘
 
     HELP;
@@ -315,10 +433,13 @@ function printShellHelp(): void
 
 // ─── Commands ───────────────────────────────────────────────────────────────
 
-function cmdDiscover(Connection $conn, array $args, bool $verbose): void
+/**
+ * @param array<string, string> $params
+ */
+function cmdDiscover(Connection $conn, array $params, bool $verbose): void
 {
-    $path = $args[0] ?? '/';
-    $domain = $args[1] ?? 'main';
+    $path = $params['path'] ?? '/';
+    $domain = $params['domain'] ?? 'main';
     info("Discovering '{$path}' (domain: {$domain})...");
 
     $response = await($conn->execute($path, $domain, 'getDiscover'));
@@ -354,13 +475,16 @@ function cmdDiscover(Connection $conn, array $args, bool $verbose): void
     }
 }
 
-function cmdGet(Connection $conn, array $args, bool $verbose): void
+/**
+ * @param array<string, string> $params
+ */
+function cmdGet(Connection $conn, array $params, bool $verbose): void
 {
-    if (count($args) < 3) {
-        throw new RuntimeException('Usage: get <path> <domain> <operation>');
-    }
+    requireParams($params, ['path', 'domain', 'operation'], 'get --path=<path> --domain=<domain> --operation=<operation>');
 
-    [$path, $domain, $operation] = $args;
+    $path = $params['path'];
+    $domain = $params['domain'];
+    $operation = $params['operation'];
     info("GET {$path} / {$domain} / {$operation}");
 
     $result = await($conn->get($path, $domain, $operation));
@@ -369,18 +493,21 @@ function cmdGet(Connection $conn, array $args, bool $verbose): void
     dumpPayload($result);
 }
 
-function cmdSet(Connection $conn, array $args, bool $verbose): void
+/**
+ * @param array<string, string> $params
+ */
+function cmdSet(Connection $conn, array $params, bool $verbose): void
 {
-    if (count($args) < 4) {
-        throw new RuntimeException('Usage: set <path> <domain> <operation> <json-payload>');
-    }
+    requireParams($params, ['path', 'domain', 'operation', 'payload'], 'set --path=<path> --domain=<domain> --operation=<operation> --payload=<json>');
 
-    [$path, $domain, $operation, $jsonPayload] = $args;
+    $path = $params['path'];
+    $domain = $params['domain'];
+    $operation = $params['operation'];
 
     /** @var array<string, mixed>|null $payload */
-    $payload = json_decode($jsonPayload, true);
+    $payload = json_decode($params['payload'], true);
     if ($payload === null) {
-        throw new RuntimeException('Invalid JSON payload');
+        throw new RuntimeException('Invalid JSON payload in --payload');
     }
 
     info("SET {$path} / {$domain} / {$operation}");
@@ -394,21 +521,23 @@ function cmdSet(Connection $conn, array $args, bool $verbose): void
     }
 }
 
-function cmdRaw(Connection $conn, array $args, bool $verbose): void
+/**
+ * @param array<string, string> $params
+ */
+function cmdRaw(Connection $conn, array $params, bool $verbose): void
 {
-    if (count($args) < 3) {
-        throw new RuntimeException('Usage: raw <path> <domain> <operation> [json-payload]');
-    }
+    requireParams($params, ['path', 'domain', 'operation'], 'raw --path=<path> --domain=<domain> --operation=<operation> [--payload=<json>]');
 
-    [$path, $domain, $operation] = $args;
-    $jsonPayload = $args[3] ?? null;
+    $path = $params['path'];
+    $domain = $params['domain'];
+    $operation = $params['operation'];
 
     /** @var array<string, mixed> $payload */
     $payload = [];
-    if ($jsonPayload !== null) {
-        $decoded = json_decode($jsonPayload, true);
+    if (isset($params['payload']) && $params['payload'] !== '') {
+        $decoded = json_decode($params['payload'], true);
         if (!is_array($decoded)) {
-            throw new RuntimeException('Invalid JSON payload');
+            throw new RuntimeException('Invalid JSON in --payload');
         }
         $payload = $decoded;
     }
@@ -428,11 +557,14 @@ function cmdRaw(Connection $conn, array $args, bool $verbose): void
     }
 }
 
-function cmdTree(Connection $conn, array $args, bool $verbose): void
+/**
+ * @param array<string, string> $params
+ */
+function cmdTree(Connection $conn, array $params, bool $verbose): void
 {
-    $rootPath = $args[0] ?? '/';
-    $maxDepth = (int) ($args[1] ?? 2);
-    $domain = $args[2] ?? 'main';
+    $rootPath = $params['path'] ?? '/';
+    $maxDepth = (int) ($params['depth'] ?? 2);
+    $domain = $params['domain'] ?? 'main';
 
     info("Building tree from '{$rootPath}' (depth {$maxDepth}, domain: {$domain})...");
 
@@ -498,10 +630,13 @@ function discoverRecursive(
     }
 }
 
-function cmdExplore(Connection $conn, array $args, bool $verbose): void
+/**
+ * @param array<string, string> $params
+ */
+function cmdExplore(Connection $conn, array $params, bool $verbose): void
 {
-    $path = $args[0] ?? '/';
-    $domain = $args[1] ?? 'main';
+    $path = $params['path'] ?? '/';
+    $domain = $params['domain'] ?? 'main';
     info("Exploring '{$path}' (domain: {$domain})...");
 
     $response = await($conn->execute($path, $domain, 'getDiscover'));
@@ -647,10 +782,13 @@ function getProbesForMoType(string $moType): array
     return $specific;
 }
 
-function cmdVlans(Connection $conn, array $args, bool $verbose): void
+/**
+ * @param array<string, string> $params
+ */
+function cmdVlans(Connection $conn, array $params, bool $verbose): void
 {
-    $path = $args[0] ?? '/unit-1';
-    $domain = $args[1] ?? 'main';
+    $path = $params['path'] ?? '/unit-1';
+    $domain = $params['domain'] ?? 'main';
     info("Reading VLAN configuration for '{$path}' (domain: {$domain})...");
 
     $response = await($conn->execute($path, $domain, 'getDiscover'));
