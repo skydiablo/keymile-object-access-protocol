@@ -56,16 +56,16 @@ if (isset($opts['help']) || $host === null) {
 
     Commands:
       shell                 Interactive shell (persistent session)
-      discover [path]       Discover managed object tree (default: /)
+      discover [path] [domain]  Discover managed object (default path: /, domain: main)
       get <path> <domain> <operation>
                             Read a property value
       set <path> <domain> <operation> <json-payload>
                             Write a property value
       raw <path> <domain> <operation> [json-payload]
                             Send raw KOAP request, show full response
-      tree [path] [depth]   Recursively discover and display object tree
-      explore <path>        Probe all known domains/operations on an object
-      vlans [path]          Show VLAN configuration for port interfaces
+      tree [path] [depth] [domain]  Recursively discover object tree (default domain: main)
+      explore [path] [domain]       Probe all known domains/operations (default domain: main)
+      vlans [path] [domain]        Show VLAN configuration (default domain: main)
 
     If no command is given, starts in interactive shell mode.
 
@@ -293,10 +293,10 @@ function printShellHelp(): void
     │    ls [path]          List children (= discover)        │
     │                                                         │
     │  Commands:                                              │
-    │    discover [path]    Discover managed object            │
-    │    tree [path] [N]    Show object tree (depth N)        │
-    │    vlans [path]       Show VLAN profile assignments     │
-    │    explore <path>     Probe available operations         │
+    │    discover [path] [domain]   Discover (default domain: main) │
+    │    tree [path] [depth] [domain]  Object tree (default domain: main) │
+    │    vlans [path] [domain]      VLAN profile assignments  │
+    │    explore [path] [domain]    Probe available operations │
     │    raw <p> <d> <op>   Send raw KOAP request             │
     │    get <p> <d> <op>   Read a property                   │
     │    set <p> <d> <op> <json>  Write a property            │
@@ -318,9 +318,10 @@ function printShellHelp(): void
 function cmdDiscover(Connection $conn, array $args, bool $verbose): void
 {
     $path = $args[0] ?? '/';
-    info("Discovering '{$path}'...");
+    $domain = $args[1] ?? 'main';
+    info("Discovering '{$path}' (domain: {$domain})...");
 
-    $response = await($conn->execute($path, 'main', 'getDiscover'));
+    $response = await($conn->execute($path, $domain, 'getDiscover'));
     $op = $response->getFirstOperation();
 
     if ($op === null || !$op->isSuccessful()) {
@@ -431,10 +432,11 @@ function cmdTree(Connection $conn, array $args, bool $verbose): void
 {
     $rootPath = $args[0] ?? '/';
     $maxDepth = (int) ($args[1] ?? 2);
+    $domain = $args[2] ?? 'main';
 
-    info("Building tree from '{$rootPath}' (depth {$maxDepth})...");
+    info("Building tree from '{$rootPath}' (depth {$maxDepth}, domain: {$domain})...");
 
-    discoverRecursive($conn, $rootPath, $maxDepth, 0, '', '');
+    discoverRecursive($conn, $rootPath, $maxDepth, 0, '', '', $domain);
 }
 
 function discoverRecursive(
@@ -444,9 +446,10 @@ function discoverRecursive(
     int $currentDepth,
     string $linePrefix,
     string $treePrefix,
+    string $domain = 'main',
 ): void {
     try {
-        $response = await($conn->execute($path, 'main', 'getDiscover'));
+        $response = await($conn->execute($path, $domain, 'getDiscover'));
         $op = $response->getFirstOperation();
 
         if ($op === null || !$op->isSuccessful()) {
@@ -486,6 +489,7 @@ function discoverRecursive(
                     $currentDepth + 1,
                     $treePrefix . $connector,
                     $nextTreePrefix,
+                    $domain,
                 );
             }
         }
@@ -497,9 +501,10 @@ function discoverRecursive(
 function cmdExplore(Connection $conn, array $args, bool $verbose): void
 {
     $path = $args[0] ?? '/';
-    info("Exploring '{$path}'...");
+    $domain = $args[1] ?? 'main';
+    info("Exploring '{$path}' (domain: {$domain})...");
 
-    $response = await($conn->execute($path, 'main', 'getDiscover'));
+    $response = await($conn->execute($path, $domain, 'getDiscover'));
     $op = $response->getFirstOperation();
 
     if ($op === null || !$op->isSuccessful()) {
@@ -645,9 +650,10 @@ function getProbesForMoType(string $moType): array
 function cmdVlans(Connection $conn, array $args, bool $verbose): void
 {
     $path = $args[0] ?? '/unit-1';
-    info("Reading VLAN configuration for '{$path}'...");
+    $domain = $args[1] ?? 'main';
+    info("Reading VLAN configuration for '{$path}' (domain: {$domain})...");
 
-    $response = await($conn->execute($path, 'main', 'getDiscover'));
+    $response = await($conn->execute($path, $domain, 'getDiscover'));
     $op = $response->getFirstOperation();
 
     if ($op === null || !$op->isSuccessful()) {
@@ -702,7 +708,7 @@ function cmdVlans(Connection $conn, array $args, bool $verbose): void
         }
 
         try {
-            $portRes = await($conn->execute($portPath, 'main', 'getDiscover'));
+            $portRes = await($conn->execute($portPath, $domain, 'getDiscover'));
             $portOp = $portRes->getFirstOperation();
             if ($portOp === null || !$portOp->isSuccessful()) {
                 echo "\033[33m{$addr}\033[0m: [discover failed]\n";

@@ -111,7 +111,7 @@ Handles serialization/deserialization of KOAP XML messages:
 
 `KoapClient` creates connections with automatic MTP handshake, `Connection` provides the high-level API:
 
-- `discover(string $destAddr)` — Explore the managed object tree
+- `discover(string $destAddr, string $mDomain = 'main')` — Explore the managed object tree (optional domain, e.g. main, cfgm, status)
 - `get(string $destAddr, string $mDomain, string $operationName)` — Read a property
 - `set(string $destAddr, string $mDomain, string $operationName, array $payload)` — Write a property
 - `execute(string $destAddr, string $mDomain, string $operationName, array $payload)` — Raw request/response

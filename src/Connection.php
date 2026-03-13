@@ -39,11 +39,13 @@ class Connection
     /**
      * Discover the managed object tree starting from the given address.
      *
+     * @param string $destAddr  Destination path (e.g. "/" or "/unit-1")
+     * @param string $mDomain   Domain for getDiscover (default "main"; other domains may exist, e.g. cfgm, status)
      * @return PromiseInterface<ManagedObject>
      */
-    public function discover(string $destAddr = '/'): PromiseInterface
+    public function discover(string $destAddr = '/', string $mDomain = 'main'): PromiseInterface
     {
-        return $this->execute($destAddr, 'main', 'getDiscover')->then(
+        return $this->execute($destAddr, $mDomain, 'getDiscover')->then(
             function (Response $response) use ($destAddr): ManagedObject {
                 $operation = $response->getFirstOperation();
                 if ($operation === null) {
